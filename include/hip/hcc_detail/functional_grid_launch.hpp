@@ -23,6 +23,7 @@ THE SOFTWARE.
 #pragma once
 
 #include "code_object_bundle.hpp"
+#include "kernel_metadata.hpp"
 #include "concepts.hpp"
 #include "helpers.hpp"
 #include "program_state.hpp"
@@ -53,6 +54,84 @@ inline T round_up_to_next_multiple_nonnegative(T x, T y) {
     return tmp - tmp % y;
 }
 
+#if defined(USE_COMGR_LIB)
+template <
+    std::size_t n,
+    typename... Ts,
+    typename std::enable_if<n == sizeof...(Ts)>::type* = nullptr>
+inline std::vector<std::uint8_t> make_kernarg(
+    const std::tuple<Ts...>&,
+    const std::vector<std::tuple<std::size_t, std::size_t, std::size_t>>&,
+    std::vector<std::uint8_t> kernarg) {
+    return kernarg;
+}
+
+template <
+    std::size_t n,
+    typename... Ts,
+    typename std::enable_if<n != sizeof...(Ts)>::type* = nullptr>
+inline std::vector<std::uint8_t> make_kernarg(
+    const std::tuple<Ts...>& formals,
+    const std::vector<std::tuple<std::size_t, std::size_t, std::size_t>>& size_align_offset,
+    std::vector<std::uint8_t> kernarg) {
+    using T = typename std::tuple_element<n, std::tuple<Ts...>>::type;
+
+    static_assert(
+        !std::is_reference<T>{},
+        "A __global__ function cannot have a reference as one of its "
+            "arguments.");
+    #if defined(HIP_STRICT)
+        static_assert(
+            std::is_trivially_copyable<T>{},
+            "Only TriviallyCopyable types can be arguments to a __global__ "
+                "function");
+    #endif
+
+    auto arg_size = std::get<0>(size_align_offset[n]);
+    auto arg_align = std::get<1>(size_align_offset[n]);
+    auto arg_offset = std::get<2>(size_align_offset[n]);
+
+    if (arg_align != 0) {  // v2 code object
+        kernarg.resize(round_up_to_next_multiple_nonnegative(kernarg.size(), arg_align) + arg_size);
+    }
+    else {
+        kernarg.resize(arg_offset + arg_size);
+    }
+
+    std::memcpy(kernarg.data() + kernarg.size() - arg_size, &std::get<n>(formals), arg_size);
+
+    return make_kernarg<n + 1>(formals, size_align_offset, std::move(kernarg));
+}
+
+template <typename... Formals, typename... Actuals>
+inline void load_kernel_metadata(
+    void (*kernel)(Formals...), std::tuple<Actuals...> actuals,
+    std::vector<std::uint8_t>* kern_arg, KernelMD* kern_desc) {
+    static_assert(sizeof...(Formals) == sizeof...(Actuals),
+        "The count of formal arguments must match the count of actuals.");
+
+    if (sizeof...(Formals) == 0) return;
+
+    auto it = function_names().find(reinterpret_cast<std::uintptr_t>(kernel));
+    if (it == function_names().cend()) {
+        hip_throw(std::runtime_error{"Undefined __global__ function."});
+    }
+
+    auto it1 = kernel_metadata().find(it->second);
+    if (it1 == kernel_metadata().end()) {
+        hip_throw(std::runtime_error{
+            "Missing metadata for __global__ function: " + it->second});
+    }
+
+    std::tuple<Formals...> to_formals{std::move(actuals)};
+    std::vector<std::uint8_t> kernarg;
+    kernarg.reserve(sizeof(to_formals));
+
+    *kern_arg =  make_kernarg<0>(to_formals, (it1->second).args_info, std::move(kernarg));
+    *kern_desc = (it1->second).descriptor;
+}
+
+#else
 template <
     std::size_t n,
     typename... Ts,
@@ -96,6 +175,7 @@ inline std::vector<std::uint8_t> make_kernarg(
     return make_kernarg<n + 1>(formals, size_align, std::move(kernarg));
 }
 
+
 template <typename... Formals, typename... Actuals>
 inline std::vector<std::uint8_t> make_kernarg(
     void (*kernel)(Formals...), std::tuple<Actuals...> actuals) {
@@ -121,7 +201,7 @@ inline std::vector<std::uint8_t> make_kernarg(
 
     return make_kernarg<0>(to_formals, it1->second, std::move(kernarg));
 }
-
+#endif
 inline
 std::string name(std::uintptr_t function_address)
 {
@@ -178,8 +258,15 @@ void hipLaunchKernelGGL(F kernel, const dim3& numBlocks, const dim3& dimBlocks,
                         std::uint32_t sharedMemBytes, hipStream_t stream,
                         Args... args) {
     hip_impl::hip_init();
+#if defined(USE_COMGR_LIB)
+    std::vector<std::uint8_t> kernarg;
+    hip_impl::KernelMD  kerndesc;
+    hip_impl::load_kernel_metadata(
+        kernel, std::tuple<Args...>{std::move(args)...}, &kernarg, &kerndesc);
+#else
     auto kernarg = hip_impl::make_kernarg(
         kernel, std::tuple<Args...>{std::move(args)...});
+#endif
     std::size_t kernarg_size = kernarg.size();
 
     void* config[]{

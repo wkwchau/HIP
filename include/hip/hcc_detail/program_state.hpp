@@ -23,6 +23,7 @@ THE SOFTWARE.
 #pragma once
 
 #include "code_object_bundle.hpp"
+#include "kernel_metadata.hpp"
 #include "hsa_helpers.hpp"
 
 #if !defined(__cpp_exceptions)
@@ -631,6 +632,221 @@ std::string lookup_keyword_value(
     return value;
 }
 
+#if defined(USE_COMGR_LIB)
+inline
+void populate_kernprops(
+    const comgr_metadata_node& kernelMeta,
+    uint32_t co_version,
+    KernelMD* kern_desc) {
+
+    amd_comgr_status_t status;
+
+    switch (co_version) {
+      case 2: {
+          amd_comgr_metadata_node_t symbolName;
+          status = amd_comgr_metadata_lookup(kernelMeta.node, "SymbolName", &(symbolName));
+          if (status == AMD_COMGR_STATUS_SUCCESS) {
+              status = getMetaBuf(symbolName, &(kern_desc->mSymbolName));
+              amd_comgr_destroy_metadata(symbolName);
+          }
+
+          amd_comgr_metadata_node_t attrMeta;
+          if (status == AMD_COMGR_STATUS_SUCCESS) {
+              if (amd_comgr_metadata_lookup(kernelMeta.node, "Attrs", &attrMeta) ==
+                  AMD_COMGR_STATUS_SUCCESS) {
+                status = amd_comgr_iterate_map_metadata(attrMeta, populateAttrs,
+                                                        static_cast<void*>(kern_desc));
+                amd_comgr_destroy_metadata(attrMeta);
+              }
+          }
+
+          // extract the code properties metadata
+          amd_comgr_metadata_node_t codePropsMeta;
+          if (status == AMD_COMGR_STATUS_SUCCESS) {
+              status = amd_comgr_metadata_lookup(kernelMeta.node, "CodeProps", &codePropsMeta);
+          }
+
+          if (status == AMD_COMGR_STATUS_SUCCESS) {
+              status = amd_comgr_iterate_map_metadata(codePropsMeta, populateCodeProps,
+                                                      static_cast<void*>(kern_desc));
+              amd_comgr_destroy_metadata(codePropsMeta);
+          }
+        }
+        break;
+      case 3: {
+            status = amd_comgr_iterate_map_metadata(kernelMeta.node, populateKernelMetaV3,
+                                                    static_cast<void*>(kern_desc));
+        }
+        break;
+      default:
+        return;
+    }
+}
+
+inline
+void populate_kernargs(
+    const comgr_metadata_node& kernelMap,
+    uint32_t co_version,
+    std::vector<std::tuple<std::size_t, std::size_t, std::size_t>>* args_info) {
+    amd_comgr_status_t status;
+    amd_comgr_metadata_kind_t mkindLookup;
+    comgr_metadata_node kernArgList;
+
+    status = amd_comgr_metadata_lookup(kernelMap.node,
+                                       (co_version == 2) ? "Args" : ".args",
+                                       &kernArgList.node);
+
+    if (status != AMD_COMGR_STATUS_SUCCESS ) {
+        return;
+    }
+
+    kernArgList.set_active(true);
+    status = amd_comgr_get_metadata_kind(kernArgList.node, &mkindLookup);
+    if (mkindLookup != AMD_COMGR_METADATA_KIND_LIST) {
+        hip_throw(std::runtime_error{"Lookup of Args didn't return a list\n"});
+    }
+
+    if (status == AMD_COMGR_STATUS_SUCCESS ) {
+        size_t num_kern_args = 0;
+        status = amd_comgr_get_metadata_list_size(kernArgList.node, &num_kern_args);
+        checkError(status, "amd_comgr_get_metadata_list_size");
+        for (int k_ar = 0; k_ar < num_kern_args; k_ar++) {
+            comgr_metadata_node kernArgMap;
+            status = amd_comgr_index_list_metadata(kernArgList.node, k_ar, &kernArgMap.node);
+            checkError(status, "amd_comgr_index_list_metadata");
+            kernArgMap.set_active(true);
+
+            size_t k_arg_size, k_arg_align, k_arg_offset;
+            if (co_version == 2) {
+                k_arg_size = std::stoul(lookup_keyword_value(kernArgMap.node, "Size"));
+                k_arg_align = std::stoul(lookup_keyword_value(kernArgMap.node, "Align"));
+                k_arg_offset = 0;
+            }
+            else {
+                k_arg_size = std::stoul(lookup_keyword_value(kernArgMap.node, ".size"));
+                k_arg_align = 0;
+                k_arg_offset = std::stoul(lookup_keyword_value(kernArgMap.node, ".offset"));
+            }
+            args_info->emplace_back(std::make_tuple(k_arg_size, k_arg_align, k_arg_offset));
+        }
+    }
+}
+
+inline
+void process_kernel_metadata(
+    amd_comgr_metadata_node_t blob_meta,
+    std::unordered_map<std::string, kernelInfo>& kernmeta) {
+    amd_comgr_status_t status;
+    amd_comgr_metadata_kind_t mkindLookup;
+    comgr_metadata_node kernelList;
+    std::string kernel_name;
+    size_t num_kernels = 0;
+    size_t num_kern_args = 0;
+    uint32_t  co_version = 0;
+
+    // Kernels is a list of MAPS!!
+    status = amd_comgr_metadata_lookup(blob_meta, "Kernels", &kernelList.node);
+    if (status == AMD_COMGR_STATUS_SUCCESS) {
+      co_version = 2;
+    }
+    else {
+      status = amd_comgr_metadata_lookup(blob_meta, "amdhsa.kernels", &kernelList.node);
+      co_version = 3;
+    }
+
+    // FIXME - few hip memset kernels are missing Kernels node
+    if(status != AMD_COMGR_STATUS_SUCCESS)
+        return;
+
+    kernelList.set_active(true);
+    status = amd_comgr_get_metadata_kind(kernelList.node, &mkindLookup);
+    if (mkindLookup != AMD_COMGR_METADATA_KIND_LIST) {
+        hip_throw(std::runtime_error{"Lookup of Kernels didn't return a list\n"});
+    }
+
+    status = amd_comgr_get_metadata_list_size(kernelList.node, &num_kernels);
+    checkError(status, "amd_comgr_get_metadata_list_size");
+    for (int i = 0; i < num_kernels; i++) {
+        comgr_metadata_node kernelMap;
+        status = amd_comgr_index_list_metadata(kernelList.node, i, &kernelMap.node);
+        checkError(status, "amd_comgr_index_list_metadata");
+        kernelMap.set_active(true);
+
+        kernel_name = std::move(lookup_keyword_value(kernelMap.node,
+                                                     co_version == 2 ? "Name" : ".name"));
+
+        // Check if this kernel was already processed
+        if (kernmeta.find(kernel_name) != kernmeta.end()) {
+            continue;
+        }
+
+        // Populate kernel information
+        kernelInfo kernel_info;
+        kernel_info.co_version = co_version;
+        populate_kernargs(kernelMap, co_version, &(kernel_info.args_info));
+        populate_kernprops(kernelMap, co_version, &(kernel_info.descriptor));
+
+        // Save it into our kernmeta
+        kernmeta[kernel_name] = kernel_info;
+    }
+}
+
+inline
+void read_kernel_metadata(
+    std::string blob,
+    std::unordered_map<std::string,kernelInfo>& kernel_metadata) {
+
+    const char *blob_buf = blob.data();
+    long blob_size = blob.size();
+
+    amd_comgr_status_t status;
+    comgr_data blob_data;
+    status = amd_comgr_create_data(AMD_COMGR_DATA_KIND_RELOCATABLE, &blob_data.data);
+    checkError(status, "amd_comgr_create_data");
+    blob_data.set_active(true);
+
+    status = amd_comgr_set_data(blob_data.data, blob_size, blob_buf);
+    if(status != AMD_COMGR_STATUS_SUCCESS)
+        return;
+
+    // We have a valid code object now
+    status = amd_comgr_set_data_name(blob_data.data, "HIP Code Object");
+    checkError(status, "amd_comgr_set_data_name");
+
+    comgr_metadata_node blob_meta;
+    status = amd_comgr_get_data_metadata(blob_data.data, &blob_meta.node);
+    checkError(status, "amd_comgr_get_data_metadata");
+    blob_meta.set_active(true);
+
+    // Root is a map
+    amd_comgr_metadata_kind_t blob_mkind;
+    status = amd_comgr_get_metadata_kind(blob_meta.node, &blob_mkind);
+    checkError(status, "amd_comgr_get_metadata_kind");
+    if (blob_mkind != AMD_COMGR_METADATA_KIND_MAP) {
+        hip_throw(std::runtime_error{"Root is not map\n"});
+    }
+
+    process_kernel_metadata(blob_meta.node, kernel_metadata);
+}
+
+inline
+__attribute__((visibility("hidden")))
+const std::unordered_map<std::string, kernelInfo>& kernel_metadata() {
+
+    static std::unordered_map<std::string, kernelInfo> r;
+    static std::once_flag f;
+
+    std::call_once(f, []() {
+        for (auto&& isa_blobs : code_object_blobs()) {
+            for (auto&& blob : isa_blobs.second) {
+                read_kernel_metadata(std::string{blob.cbegin(), blob.cend()}, r);
+            }
+        }
+    });
+
+    return r;
+}
+#else
 inline
 void process_kernarg_metadata(
     amd_comgr_metadata_node_t blob_meta,
@@ -664,7 +880,8 @@ void process_kernarg_metadata(
         checkError(status, "amd_comgr_index_list_metadata");
         kernelMap.set_active(true);
 
-        kernel_name = std::move(lookup_keyword_value(kernelMap.node, "Name"));
+        kernel_name = std::move(lookup_keyword_value(kernelMap.node,
+                                                     co_version == 2 ? "Name" : ".name"));
 
         // Check if this kernel was already processed
         if(!kernargs[kernel_name].empty()) {
@@ -760,4 +977,5 @@ const std::unordered_map<
 
     return r;
 }
+#endif
 }  // Namespace hip_impl.

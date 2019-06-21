@@ -1128,6 +1128,9 @@ hipError_t hipMemcpyFromSymbolAsync(void* dst, const void* src, size_t count,
 
 //---
 hipError_t hipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind) {
+
+uint64_t tstart0 = hc::get_system_ticks();
+
     HIP_INIT_SPECIAL_API(hipMemcpy, (TRACE_MCMD), dst, src, sizeBytes, kind);
 
     hipError_t e = hipSuccess;
@@ -1136,6 +1139,7 @@ hipError_t hipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind
     if (sizeBytes == 0) return ihipLogStatus(e);
 
     hipStream_t stream = ihipSyncAndResolveStream(hipStreamNull);
+uint64_t tend0 = hc::get_system_ticks();
 
     hc::completion_future marker;
 
@@ -1144,12 +1148,20 @@ hipError_t hipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind
 	e=hipErrorInvalidValue;
 	return ihipLogStatus(e);
 	}
+uint64_t tend1 = hc::get_system_ticks();
     try {
         stream->locked_copySync(dst, src, sizeBytes, kind);
     } catch (ihipException& ex) {
         e = ex._code;
     }
 
+uint64_t tend2 = hc::get_system_ticks();
+uint64_t telapsed0 = tend0 - tstart0;
+std::cout << "hipMemcpy ticks - start: " << tstart0 << "; end: " << tend0 << "; elapsed: " << telapsed0 << std::endl;
+uint64_t telapsed1 = tend1 - tstart0;
+std::cout << "  >> hipMemcpy ticks - start: " << tstart0 << "; end: " << tend1 << "; elapsed: " << telapsed1 << std::endl;
+uint64_t telapsed2 = tend2 - tstart0;
+std::cout << "    >>>> hipMemcpy ticks - start: " << tstart0 << "; end: " << tend2 << "; elapsed: " << telapsed2 << std::endl;
     return ihipLogStatus(e);
 }
 

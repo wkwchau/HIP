@@ -2092,9 +2092,13 @@ void ihipStream_t::locked_copySync(void* dst, const void* src, size_t sizeBytes,
         printPointerInfo(DB_COPY, "  src", src, srcPtrInfo);
 
 
+uint64_t tstart = hc::get_system_ticks();
         crit->_av.copy_ext(src, dst, sizeBytes, hcCopyDir, srcPtrInfo, dstPtrInfo,
                            copyDevice ? &copyDevice->getDevice()->_acc : nullptr,
                            forceUnpinnedCopy);
+uint64_t tend = hc::get_system_ticks();
+uint64_t telapsed = tend - tstart;
+std::cout << "copy_ext ticks - start: " << tstart << "; end: " << tend << "; elapsed: " << telapsed << std::endl;
     }
 }
 
